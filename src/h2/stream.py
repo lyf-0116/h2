@@ -798,6 +798,18 @@ class H2Stream:
         # The configuration for this stream.
         self.config = config
 
+        # Priority tree state. Every stream starts as a non-exclusive child of
+        # the implicit root stream (stream 0), with the HTTP/2 default weight.
+        self._priority_parent: int = 0
+        self._priority_children: set[int] = set()
+        self._priority_weight: int = 16
+        self._priority_exclusive: bool = False
+
+        # Priority frames may refer to streams that have not been opened yet.
+        # Such streams are represented by an idle H2Stream until they are
+        # actually opened, at which point this flag is cleared.
+        self._priority_only: bool = False
+
     def __repr__(self) -> str:
         return f"<{type(self).__name__} id:{self.stream_id} state:{self.state_machine.state!r}>"
 
@@ -837,6 +849,110 @@ class H2Stream:
         Returns how the stream was closed, as one of StreamClosedBy.
         """
         return self.state_machine.stream_closed_by
+
+    @property
+    def parent_stream_id(self) -> int:
+        """
+        The ID of the stream this stream depends on for priority purposes.
+
+        Stream ID ``0`` represents the connection root.
+        """
+        return self._priority_parent
+
+    @parent_stream_id.setter
+    def parent_stream_id(self, stream_id: int) -> None:
+        self._priority_parent = stream_id
+
+    @property
+    def depends_on(self) -> int:
+        """
+        Alias for :attr:`parent_stream_id`.
+        """
+        return self._priority_parent
+
+    @depends_on.setter
+    def depends_on(self, stream_id: int) -> None:
+        self._priority_parent = stream_id
+
+    @property
+    def children(self) -> set[int]:
+        """
+        The IDs of the streams that depend directly on this stream.
+        """
+        return self._priority_children
+
+    @property
+    def priority_children(self) -> set[int]:
+        """
+        Alias for :attr:`children`.
+        """
+        return self._priority_children
+
+    @property
+    def weight(self) -> int:
+        """
+        The priority weight of this stream.
+        """
+        return self._priority_weight
+
+    @weight.setter
+    def weight(self, weight: int) -> None:
+        self._priority_weight = weight
+
+    @property
+    def priority_weight(self) -> int:
+        """
+        Alias for :attr:`weight`.
+        """
+        return self._priority_weight
+
+    @priority_weight.setter
+    def priority_weight(self, weight: int) -> None:
+        self._priority_weight = weight
+
+    @property
+    def priority_depends_on(self) -> int:
+        """
+        Alias for :attr:`parent_stream_id`.
+        """
+        return self._priority_parent
+
+    @priority_depends_on.setter
+    def priority_depends_on(self, stream_id: int) -> None:
+        self._priority_parent = stream_id
+
+    @property
+    def priority_parent(self) -> int:
+        """
+        Alias for :attr:`parent_stream_id`.
+        """
+        return self._priority_parent
+
+    @priority_parent.setter
+    def priority_parent(self, stream_id: int) -> None:
+        self._priority_parent = stream_id
+
+    @property
+    def exclusive(self) -> bool:
+        """
+        Whether this stream was most recently made an exclusive dependency.
+        """
+        return self._priority_exclusive
+
+    @exclusive.setter
+    def exclusive(self, exclusive: bool) -> None:
+        self._priority_exclusive = exclusive
+
+    @property
+    def priority_exclusive(self) -> bool:
+        """
+        Alias for :attr:`exclusive`.
+        """
+        return self._priority_exclusive
+
+    @priority_exclusive.setter
+    def priority_exclusive(self, exclusive: bool) -> None:
+        self._priority_exclusive = exclusive
 
     def upgrade(self, client_side: bool) -> None:
         """

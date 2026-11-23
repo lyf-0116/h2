@@ -149,11 +149,13 @@ frame for a given stream, giving a malicious peer an easy route to force a
 h2 user to allocate nearly unbounded amounts of memory.
 
 For this reason, h2 circumvents the stream FSM entirely for ``PRIORITY``
-frames. Instead, these frames are treated as being connection-level frames that
-*just happen* to identify a specific stream. They do not bring streams into
-being, or in any sense interact with h2's view of streams. Their stream
-details are treated as strictly metadata that h2 is not interested in
-beyond being able to parse it out.
+frames. They are processed at connection level and never trigger a stream
+state transition. h2 does, however, track the RFC 7540 dependency tree: each
+stream records its parent, its children, and its weight. Exclusive
+dependencies reparent the parent's existing children, and when a stream is
+closed its children are promoted to its parent. ``PRIORITY`` frames may refer
+to streams that have not been opened yet; h2 represents those as idle stream
+objects until the stream is actually opened.
 
 
 .. _RFC 7540 Section 6.3: https://tools.ietf.org/html/rfc7540#section-6.3

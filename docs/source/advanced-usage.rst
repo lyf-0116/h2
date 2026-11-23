@@ -14,12 +14,11 @@ h2 does not enforce any priority logic by default for servers. This is
 because scheduling data sends is outside the scope of this library, as it
 likely requires fairly substantial understanding of the scheduler being used.
 
-However, for servers that *do* want to follow the priority recommendations
-given by clients, the Hyper project provides `an implementation`_ of the
-`RFC 7540`_ priority tree that will be useful to plug into a server. That,
-combined with the :class:`PriorityUpdated <h2.events.PriorityUpdated>` event from
-this library, can be used to build a server that conforms to RFC 7540's
-recommendations for priority handling.
+For servers that *do* want to follow the priority recommendations given by
+clients, h2 tracks the RFC 7540 dependency tree on its stream objects. Each
+stream exposes its priority parent, children, and weight, and the tree is
+updated as priority information arrives. Scheduling data according to that
+tree remains the responsibility of the server implementation.
 
 Related Events
 --------------

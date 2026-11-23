@@ -325,6 +325,7 @@ class H2Connection:
     def __init__(self, config: H2Configuration | None = None) -> None:
         self.state_machine = H2ConnectionStateMachine()
         self.streams: dict[int, H2Stream] = {}
+        self._priority_root_children: set[int] = set()
         self.highest_inbound_stream_id = 0
         self.highest_outbound_stream_id = 0
         self.encoder = Encoder()
@@ -439,6 +440,7 @@ class H2Connection:
                 to_delete.append(stream_id)
 
         for stream_id in to_delete:
+            self._promote_priority_children(stream_id)
             stream = self.streams.pop(stream_id)
             self._closed_streams[stream_id] = stream.closed_by
 
@@ -483,11 +485,27 @@ class H2Connection:
         self.config.logger.debug(
             "Attempting to initiate stream ID %d", stream_id,
         )
-        outbound = self._stream_id_is_outbound(stream_id)
         highest_stream_id = (
-            self.highest_outbound_stream_id if outbound else
+            self.highest_outbound_stream_id if self._stream_id_is_outbound(stream_id) else
             self.highest_inbound_stream_id
         )
+
+        existing_stream = self.streams.get(stream_id)
+        if existing_stream is not None and existing_stream._priority_only:
+            if stream_id <= highest_stream_id:
+                raise StreamIDTooLowError(stream_id, highest_stream_id)
+
+            if (stream_id % 2) != int(allowed_ids):
+                msg = "Invalid stream ID for peer."
+                raise ProtocolError(msg)
+
+            existing_stream._priority_only = False
+            if self._stream_id_is_outbound(stream_id):
+                self.highest_outbound_stream_id = stream_id
+            else:
+                self.highest_inbound_stream_id = stream_id
+
+            return existing_stream
 
         if stream_id <= highest_stream_id:
             raise StreamIDTooLowError(stream_id, highest_stream_id)
@@ -506,14 +524,149 @@ class H2Connection:
         s.max_outbound_frame_size = self.max_outbound_frame_size
 
         self.streams[stream_id] = s
+        self._priority_root_children.add(stream_id)
         self.config.logger.debug("Current streams: %s", self.streams.keys())
 
-        if outbound:
+        if self._stream_id_is_outbound(stream_id):
             self.highest_outbound_stream_id = stream_id
         else:
             self.highest_inbound_stream_id = stream_id
 
         return s
+
+    def _get_priority_stream(self, stream_id: int) -> H2Stream:
+        """
+        Return the stream used to represent ``stream_id`` in the priority tree.
+
+        PRIORITY frames may refer to streams that have not been opened yet.
+        Such streams are represented by an idle :class:`H2Stream` that is
+        promoted to a normal stream if and when the stream is opened.
+        """
+        try:
+            return self.streams[stream_id]
+        except KeyError:
+            pass
+
+        stream = H2Stream(
+            stream_id,
+            config=self.config,
+            inbound_window_size=self.local_settings.initial_window_size,
+            outbound_window_size=self.remote_settings.initial_window_size,
+        )
+        stream.max_outbound_frame_size = self.max_outbound_frame_size
+        stream._priority_only = True
+        self.streams[stream_id] = stream
+        self._priority_root_children.add(stream_id)
+        return stream
+
+    def _priority_children_for(self, stream_id: int) -> set[int]:
+        """
+        Return the set of children of a priority tree node.
+        """
+        if stream_id == 0:
+            return self._priority_root_children
+        return self._get_priority_stream(stream_id).children
+
+    def _remove_priority_child(self, parent_stream_id: int, stream_id: int) -> None:
+        """
+        Remove ``stream_id`` from the children of its priority parent.
+        """
+        if parent_stream_id == 0:
+            self._priority_root_children.discard(stream_id)
+            return
+
+        parent = self.streams.get(parent_stream_id)
+        if parent is not None:
+            parent.children.discard(stream_id)
+
+    def _update_priority_tree(self,
+                              stream_id: int,
+                              depends_on: int,
+                              weight: int,
+                              exclusive: bool) -> None:
+        """
+        Apply priority information to the stream dependency tree.
+        """
+        if stream_id == depends_on:
+            msg = f"Stream {stream_id} may not depend on itself"
+            raise ProtocolError(msg)
+
+        stream = self._get_priority_stream(stream_id)
+        if depends_on:
+            self._get_priority_stream(depends_on)
+
+        stream.weight = weight
+        stream.exclusive = exclusive
+
+        if stream.parent_stream_id != depends_on:
+            self._remove_priority_child(stream.parent_stream_id, stream_id)
+            stream.parent_stream_id = depends_on
+
+        if exclusive:
+            parent_children = self._priority_children_for(depends_on)
+            inherited = set(parent_children)
+            inherited.discard(stream_id)
+
+            for child_id in inherited:
+                child = self._get_priority_stream(child_id)
+                child.parent_stream_id = stream_id
+                stream.children.add(child_id)
+
+            parent_children.clear()
+            parent_children.add(stream_id)
+        else:
+            self._priority_children_for(depends_on).add(stream_id)
+
+    def _promote_priority_children(self, stream_id: int) -> None:
+        """
+        Remove a closed stream from the priority tree, promoting its children.
+
+        The stream's children become children of the closed stream's parent.
+        """
+        stream = self.streams.get(stream_id)
+        if stream is None:
+            return
+
+        parent_stream_id = self._live_priority_parent(stream.parent_stream_id)
+        parent_children = self._priority_children_for(parent_stream_id)
+        parent_children.discard(stream_id)
+
+        for child_id in set(stream.children):
+            child = self._get_priority_stream(child_id)
+            child.parent_stream_id = parent_stream_id
+            parent_children.add(child_id)
+
+        stream.children.clear()
+
+    def _live_priority_parent(self, parent_stream_id: int) -> int:
+        """
+        Walk past closed ancestors to find where promoted children belong.
+        """
+        seen = {0}
+        while parent_stream_id:
+            if parent_stream_id in seen:
+                return 0
+            seen.add(parent_stream_id)
+
+            parent = self.streams.get(parent_stream_id)
+            if parent is None:
+                return 0 if parent_stream_id in self._closed_streams else parent_stream_id
+            if not parent.closed:
+                return parent_stream_id
+            parent_stream_id = parent.parent_stream_id
+
+        return 0
+
+    def _promote_closed_stream(self, stream_id: int | None) -> None:
+        """
+        Promote the children of ``stream_id`` if that stream is now closed.
+        """
+        if not stream_id:
+            return
+
+        stream = self.streams.get(stream_id)
+        if stream is not None and stream.closed:
+            self._promote_priority_children(stream_id)
 
     def initiate_connection(self) -> None:
         """
@@ -618,10 +771,10 @@ class H2Connection:
         .. versionchanged:: 2.0.0
            Removed this function from the public API.
         """
-        try:
-            return self.streams[stream_id]
-        except KeyError:
+        stream = self.streams.get(stream_id)
+        if stream is None or stream._priority_only:
             return self._begin_new_stream(stream_id, allowed_ids)
+        return stream
 
     def _get_stream_by_id(self, stream_id: int | None) -> H2Stream:
         """
@@ -793,7 +946,8 @@ class H2Connection:
         )
 
         # Check we can open the stream.
-        if stream_id not in self.streams:
+        existing_stream = self.streams.get(stream_id)
+        if existing_stream is None or existing_stream._priority_only:
             max_open_streams = self.remote_settings.max_concurrent_streams
             value = self.open_outbound_streams # take a copy due to the property accessor having side affects
             if (value + 1) > max_open_streams:
@@ -826,14 +980,23 @@ class H2Connection:
             assert isinstance(headers_frame, HeadersFrame)
 
             headers_frame.flags.add("PRIORITY")
-            frames[0] = _add_frame_priority(
+            priority_frame = _add_frame_priority(
                 headers_frame,
                 priority_weight,
                 priority_depends_on,
                 priority_exclusive,
             )
+            assert isinstance(priority_frame, HeadersFrame)
+            frames[0] = priority_frame
+            self._update_priority_tree(
+                stream_id,
+                priority_frame.depends_on,
+                priority_frame.stream_weight + 1,
+                priority_frame.exclusive,
+            )
 
         self._prepare_for_sending(frames)
+        self._promote_closed_stream(stream_id)
 
     def send_data(self,
                   stream_id: int,
@@ -903,6 +1066,7 @@ class H2Connection:
         )
 
         self._prepare_for_sending(frames)
+        self._promote_closed_stream(stream_id)
 
         self.outbound_flow_control_window -= frame_size
         self.config.logger.debug(
@@ -930,6 +1094,7 @@ class H2Connection:
         self.state_machine.process_input(ConnectionInputs.SEND_DATA)
         frames = self._get_stream_by_id(stream_id).end_stream()
         self._prepare_for_sending(frames)
+        self._promote_closed_stream(stream_id)
 
     def increment_flow_control_window(self, increment: int, stream_id: int | None = None) -> None:
         """
@@ -1074,6 +1239,7 @@ class H2Connection:
         stream = self._get_stream_by_id(stream_id)
         frames = stream.reset_stream(error_code)
         self._prepare_for_sending(frames)
+        self._promote_closed_stream(stream_id)
 
     def close_connection(self,
                          error_code: ErrorCodes | int = 0,
@@ -1237,13 +1403,10 @@ class H2Connection:
                      priority information, and relatively little utility is
                      provided by making that functionality available.
 
-        .. note:: h2 **does not** maintain any information about the
-                  RFC 7540 priority tree. That means that h2 does not
-                  prevent incautious users from creating invalid priority
-                  trees, particularly by creating priority loops. While some
-                  basic error checking is provided by h2, users are
-                  strongly recommended to understand their prioritisation
-                  strategies before using the priority tools here.
+        .. note:: h2 maintains the structure of the RFC 7540 priority tree,
+                  including exclusive dependencies and the promotion of
+                  children when a stream is closed. It does not schedule data
+                  according to that tree.
 
         .. note:: Priority information is strictly advisory. Servers are
                   allowed to disregard it entirely. Avoid relying on the idea
@@ -1285,6 +1448,12 @@ class H2Connection:
 
         frame = PriorityFrame(stream_id)
         frame_prio = _add_frame_priority(frame, weight, depends_on, exclusive)
+        self._update_priority_tree(
+            stream_id,
+            frame_prio.depends_on,
+            frame_prio.stream_weight + 1,
+            frame_prio.exclusive,
+        )
 
         self._prepare_for_sending([frame_prio])
 
@@ -1578,6 +1747,7 @@ class H2Connection:
                 raise
         else:
             self._prepare_for_sending(frames)
+            self._promote_closed_stream(frame.stream_id)
 
         return events
 
@@ -1598,7 +1768,8 @@ class H2Connection:
         """
         # If necessary, check we can open the stream. Also validate that the
         # stream ID is valid.
-        if frame.stream_id not in self.streams:
+        existing_stream = self.streams.get(frame.stream_id)
+        if existing_stream is None or existing_stream._priority_only:
             max_open_streams = self.local_settings.max_concurrent_streams
             value = self.open_inbound_streams # take a copy due to the property accessor having side affects
             if (value + 1) > max_open_streams:
@@ -1886,6 +2057,13 @@ class H2Connection:
         if event.depends_on == frame.stream_id:
             msg = f"Stream {frame.stream_id} may not depend on itself"
             raise ProtocolError(msg)
+
+        self._update_priority_tree(
+            frame.stream_id,
+            event.depends_on,
+            event.weight,
+            event.exclusive,
+        )
         events.append(event)
 
         return [], events
