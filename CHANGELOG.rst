@@ -14,7 +14,12 @@ dev
 
 **Bugfixes**
 
--
+- Track GOAWAY ``last_stream_id`` as connection state in both directions.
+  The lowest value ever sent or received is retained, so an endpoint can no
+  longer emit or accept a GOAWAY that raises the watermark. Outbound streams
+  above the received watermark are now reset locally with
+  ``REFUSED_STREAM`` and surface a retryable ``StreamReset`` event instead of
+  remaining open.
 
 4.4.1 (2026-08-03)
 ------------------

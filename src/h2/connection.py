@@ -43,6 +43,7 @@ from .events import (
     RequestReceived,
     ResponseReceived,
     SettingsAcknowledged,
+    StreamReset,
     TrailersReceived,
     UnknownFrameReceived,
     WindowUpdated,
@@ -327,6 +328,12 @@ class H2Connection:
         self.streams: dict[int, H2Stream] = {}
         self.highest_inbound_stream_id = 0
         self.highest_outbound_stream_id = 0
+        # The lowest last stream ID advertised by either peer in a GOAWAY
+        # frame. GOAWAY last stream IDs are only allowed to move backwards,
+        # so we retain the minimum value seen over the lifetime of the
+        # connection. ``None`` means no GOAWAY has been observed yet.
+        self._sent_goaway_last_stream_id: int | None = None
+        self._received_goaway_last_stream_id: int | None = None
         self.encoder = Encoder()
         self.decoder = Decoder()
 
@@ -1102,6 +1109,7 @@ class H2Connection:
 
         if last_stream_id is None:
             last_stream_id = self.highest_inbound_stream_id
+        last_stream_id = self._record_sent_goaway(last_stream_id)
 
         f = GoAwayFrame(
             stream_id=0,
@@ -1110,6 +1118,24 @@ class H2Connection:
             additional_data=(additional_data or b""),
         )
         self._prepare_for_sending([f])
+
+    def _record_sent_goaway(self, last_stream_id: int) -> int:
+        """
+        Record a GOAWAY frame that this peer is about to emit and return the
+        last stream ID that may actually be advertised on the wire.
+
+        RFC 9113 section 6.8 forbids a receiver from considering a GOAWAY with
+        a last stream ID higher than a previously received one, so the
+        advertised value can only move backwards: we keep the minimum value
+        ever sent and clamp any attempt to raise the watermark.
+        """
+        if self._sent_goaway_last_stream_id is None:
+            self._sent_goaway_last_stream_id = last_stream_id
+        else:
+            self._sent_goaway_last_stream_id = min(
+                self._sent_goaway_last_stream_id, last_stream_id,
+            )
+        return self._sent_goaway_last_stream_id
 
     def update_settings(self, new_settings: dict[SettingCodes | int, int]) -> None:
         """
@@ -1587,7 +1613,9 @@ class H2Connection:
         GOAWAY frames.
         """
         f = GoAwayFrame(0)
-        f.last_stream_id = self.highest_inbound_stream_id
+        f.last_stream_id = self._record_sent_goaway(
+            self.highest_inbound_stream_id,
+        )
         f.error_code = error_code
         self.state_machine.process_input(ConnectionInputs.SEND_GOAWAY)
         self._prepare_for_sending([f])
@@ -1898,17 +1926,71 @@ class H2Connection:
             ConnectionInputs.RECV_GOAWAY,
         )
 
+        # GOAWAY last stream IDs may only move backwards. Retain the minimum
+        # watermark ever received so that a later frame cannot widen the set
+        # of streams the remote peer claims to have processed.
+        first_goaway = self._received_goaway_last_stream_id is None
+        if self._received_goaway_last_stream_id is None:
+            self._received_goaway_last_stream_id = frame.last_stream_id
+        else:
+            self._received_goaway_last_stream_id = min(
+                self._received_goaway_last_stream_id, frame.last_stream_id,
+            )
+
         # Clear the outbound data buffer: we cannot send further data now.
-        self.clear_outbound_data_buffer()
+        # Only the first GOAWAY clears it, otherwise frames queued while
+        # handling an earlier GOAWAY (such as the RST_STREAM resets below)
+        # would be discarded when a subsequent GOAWAY is processed.
+        if first_goaway:
+            self.clear_outbound_data_buffer()
+
+        # Any outbound stream above the watermark was not processed by the
+        # remote peer and therefore remains safe to retry. Reset it locally
+        # with REFUSED_STREAM so that the caller is told to retry the request
+        # instead of leaving it dangling in an open state.
+        frames, reset_events = self._reset_outbound_streams_for_goaway(
+            self._received_goaway_last_stream_id,
+        )
+        events.extend(reset_events)
 
         # Fire an appropriate ConnectionTerminated event.
         new_event = ConnectionTerminated()
         new_event.error_code = _error_code_from_int(frame.error_code)
-        new_event.last_stream_id = frame.last_stream_id
+        new_event.last_stream_id = self._received_goaway_last_stream_id
         new_event.additional_data = frame.additional_data or None
         events.append(new_event)
 
-        return [], events
+        return frames, events
+
+    def _reset_outbound_streams_for_goaway(
+        self, last_stream_id: int,
+    ) -> tuple[list[Frame], list[Event]]:
+        """
+        Reset every open outbound stream whose ID is higher than the GOAWAY
+        last stream ID, signalling that the request may be retried on a new
+        connection.
+        """
+        frames: list[Frame] = []
+        events: list[Event] = []
+
+        for stream_id, stream in self.streams.items():
+            if (
+                stream_id > last_stream_id
+                and self._stream_id_is_outbound(stream_id)
+                and not stream.closed
+            ):
+                frames.extend(
+                    stream.reset_stream(ErrorCodes.REFUSED_STREAM),
+                )
+                events.append(
+                    StreamReset(
+                        stream_id=stream_id,
+                        error_code=ErrorCodes.REFUSED_STREAM,
+                        remote_reset=False,
+                    ),
+                )
+
+        return frames, events
 
     def _receive_naked_continuation(self, frame: ContinuationFrame) -> None:
         """

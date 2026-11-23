@@ -1761,6 +1761,28 @@ class TestBasicServer:
 
         assert c.data_to_send() == (f.serialize() * 3)
 
+    def test_sent_goaway_last_stream_id_only_moves_backwards(
+        self, frame_factory,
+    ) -> None:
+        """
+        The last stream ID of a GOAWAY we emit may only move backwards: an
+        attempt to raise the watermark on a later GOAWAY is clamped down to
+        the lowest value ever sent instead of being emitted verbatim.
+        """
+        c = h2.connection.H2Connection(config=self.server_config)
+        c.receive_data(frame_factory.preamble())
+        c.clear_outbound_data_buffer()
+
+        c.close_connection(last_stream_id=7)
+        c.close_connection(last_stream_id=3)
+        c.close_connection(last_stream_id=9)
+
+        assert c.data_to_send() == (
+            frame_factory.build_goaway_frame(last_stream_id=7).serialize()
+            + frame_factory.build_goaway_frame(last_stream_id=3).serialize()
+            + frame_factory.build_goaway_frame(last_stream_id=3).serialize()
+        )
+
     def test_receiving_goaway_frame(self, frame_factory) -> None:
         """
         Receiving a GOAWAY frame causes a ConnectionTerminated event to be
@@ -1805,6 +1827,72 @@ class TestBasicServer:
             isinstance(event, h2.events.ConnectionTerminated)
             for event in events
         )
+
+    def test_receiving_multiple_goaway_frames_keeps_lowest_watermark(
+        self, frame_factory,
+    ) -> None:
+        """
+        A later GOAWAY cannot raise the last stream ID watermark: the minimum
+        value ever received is retained, and outbound streams above that
+        watermark are reset as retryable with REFUSED_STREAM.
+        """
+        client_config = h2.config.H2Configuration(
+            client_side=True, header_encoding="utf-8",
+        )
+        c = h2.connection.H2Connection(config=client_config)
+        c.initiate_connection()
+        c.clear_outbound_data_buffer()
+
+        request_headers = [
+            (":authority", "example.com"),
+            (":path", "/"),
+            (":scheme", "https"),
+            (":method", "GET"),
+        ]
+        for stream_id in (1, 3, 5):
+            c.send_headers(stream_id, request_headers)
+        c.clear_outbound_data_buffer()
+
+        frames = (
+            frame_factory.build_goaway_frame(last_stream_id=5).serialize()
+            + frame_factory.build_goaway_frame(last_stream_id=1).serialize()
+            + frame_factory.build_goaway_frame(last_stream_id=9).serialize()
+        )
+        events = c.receive_data(frames)
+
+        terminated = [
+            event for event in events
+            if isinstance(event, h2.events.ConnectionTerminated)
+        ]
+        assert [event.last_stream_id for event in terminated] == [5, 1, 1]
+
+        resets = [
+            event for event in events
+            if isinstance(event, h2.events.StreamReset)
+        ]
+        assert len(resets) == 2
+        assert {event.stream_id for event in resets} == {3, 5}
+        assert all(
+            event.error_code == h2.errors.ErrorCodes.REFUSED_STREAM
+            for event in resets
+        )
+        assert all(event.remote_reset is False for event in resets)
+
+        assert c.data_to_send() == (
+            frame_factory.build_rst_stream_frame(
+                stream_id=3,
+                error_code=h2.errors.ErrorCodes.REFUSED_STREAM,
+            ).serialize()
+            + frame_factory.build_rst_stream_frame(
+                stream_id=5,
+                error_code=h2.errors.ErrorCodes.REFUSED_STREAM,
+            ).serialize()
+        )
+
+        # The stream at or below the watermark stays open; the reset ones do
+        # not count any longer.
+        assert c.open_outbound_streams == 1
+        assert c.streams[1].open
 
     def test_receiving_goaway_frame_with_additional_data(self, frame_factory) -> None:
         """
