@@ -14,7 +14,14 @@ dev
 
 **Bugfixes**
 
--
+- Sending a GOAWAY frame no longer moves the connection directly to the
+  terminal ``CLOSED`` state. Instead the connection enters a new ``DRAINING``
+  state in which in-flight streams (those at or below the last stream ID sent
+  in the GOAWAY frame) may continue to exchange data and window updates,
+  while new streams beyond that bound are rejected. This makes it possible to
+  perform a graceful two-phase shutdown by first sending a GOAWAY frame with
+  a very large last stream ID and later narrowing it with further GOAWAY
+  frames.
 
 4.4.1 (2026-08-03)
 ------------------

@@ -78,6 +78,7 @@ class ConnectionState(Enum):
     CLIENT_OPEN = 1
     SERVER_OPEN = 2
     CLOSED = 3
+    DRAINING = 4
 
 
 class ConnectionInputs(Enum):
@@ -147,7 +148,7 @@ class H2ConnectionStateMachine:
         (ConnectionState.IDLE, ConnectionInputs.RECV_PING):
             (None, ConnectionState.IDLE),
         (ConnectionState.IDLE, ConnectionInputs.SEND_GOAWAY):
-            (None, ConnectionState.CLOSED),
+            (None, ConnectionState.DRAINING),
         (ConnectionState.IDLE, ConnectionInputs.RECV_GOAWAY):
             (None, ConnectionState.CLOSED),
         (ConnectionState.IDLE, ConnectionInputs.SEND_PRIORITY):
@@ -165,7 +166,7 @@ class H2ConnectionStateMachine:
         (ConnectionState.CLIENT_OPEN, ConnectionInputs.SEND_DATA):
             (None, ConnectionState.CLIENT_OPEN),
         (ConnectionState.CLIENT_OPEN, ConnectionInputs.SEND_GOAWAY):
-            (None, ConnectionState.CLOSED),
+            (None, ConnectionState.DRAINING),
         (ConnectionState.CLIENT_OPEN, ConnectionInputs.SEND_WINDOW_UPDATE):
             (None, ConnectionState.CLIENT_OPEN),
         (ConnectionState.CLIENT_OPEN, ConnectionInputs.SEND_PING):
@@ -206,7 +207,7 @@ class H2ConnectionStateMachine:
         (ConnectionState.SERVER_OPEN, ConnectionInputs.SEND_DATA):
             (None, ConnectionState.SERVER_OPEN),
         (ConnectionState.SERVER_OPEN, ConnectionInputs.SEND_GOAWAY):
-            (None, ConnectionState.CLOSED),
+            (None, ConnectionState.DRAINING),
         (ConnectionState.SERVER_OPEN, ConnectionInputs.SEND_WINDOW_UPDATE):
             (None, ConnectionState.SERVER_OPEN),
         (ConnectionState.SERVER_OPEN, ConnectionInputs.SEND_PING):
@@ -245,6 +246,56 @@ class H2ConnectionStateMachine:
             (None, ConnectionState.CLOSED),
         (ConnectionState.CLOSED, ConnectionInputs.RECV_GOAWAY):
             (None, ConnectionState.CLOSED),
+
+        # State: draining. Reached after sending a GOAWAY frame: in-flight
+        # streams (those at or below the last stream ID sent in the GOAWAY
+        # frame) may continue to exchange frames, but new streams are
+        # rejected. H2Connection enforces the stream ID bound: the state
+        # machine simply permits the frame-level inputs here. Sending a
+        # further GOAWAY frame (to narrow the last stream ID) keeps the
+        # connection in this state.
+        (ConnectionState.DRAINING, ConnectionInputs.SEND_HEADERS):
+            (None, ConnectionState.DRAINING),
+        (ConnectionState.DRAINING, ConnectionInputs.SEND_PUSH_PROMISE):
+            (None, ConnectionState.DRAINING),
+        (ConnectionState.DRAINING, ConnectionInputs.SEND_DATA):
+            (None, ConnectionState.DRAINING),
+        (ConnectionState.DRAINING, ConnectionInputs.SEND_GOAWAY):
+            (None, ConnectionState.DRAINING),
+        (ConnectionState.DRAINING, ConnectionInputs.SEND_WINDOW_UPDATE):
+            (None, ConnectionState.DRAINING),
+        (ConnectionState.DRAINING, ConnectionInputs.SEND_PING):
+            (None, ConnectionState.DRAINING),
+        (ConnectionState.DRAINING, ConnectionInputs.SEND_SETTINGS):
+            (None, ConnectionState.DRAINING),
+        (ConnectionState.DRAINING, ConnectionInputs.SEND_PRIORITY):
+            (None, ConnectionState.DRAINING),
+        (ConnectionState.DRAINING, ConnectionInputs.SEND_RST_STREAM):
+            (None, ConnectionState.DRAINING),
+        (ConnectionState.DRAINING, ConnectionInputs.RECV_HEADERS):
+            (None, ConnectionState.DRAINING),
+        (ConnectionState.DRAINING, ConnectionInputs.RECV_PUSH_PROMISE):
+            (None, ConnectionState.DRAINING),
+        (ConnectionState.DRAINING, ConnectionInputs.RECV_DATA):
+            (None, ConnectionState.DRAINING),
+        (ConnectionState.DRAINING, ConnectionInputs.RECV_GOAWAY):
+            (None, ConnectionState.CLOSED),
+        (ConnectionState.DRAINING, ConnectionInputs.RECV_WINDOW_UPDATE):
+            (None, ConnectionState.DRAINING),
+        (ConnectionState.DRAINING, ConnectionInputs.RECV_PING):
+            (None, ConnectionState.DRAINING),
+        (ConnectionState.DRAINING, ConnectionInputs.RECV_SETTINGS):
+            (None, ConnectionState.DRAINING),
+        (ConnectionState.DRAINING, ConnectionInputs.RECV_PRIORITY):
+            (None, ConnectionState.DRAINING),
+        (ConnectionState.DRAINING, ConnectionInputs.RECV_RST_STREAM):
+            (None, ConnectionState.DRAINING),
+        (ConnectionState.DRAINING,
+            ConnectionInputs.SEND_ALTERNATIVE_SERVICE):
+                (None, ConnectionState.DRAINING),
+        (ConnectionState.DRAINING,
+            ConnectionInputs.RECV_ALTERNATIVE_SERVICE):
+                (None, ConnectionState.DRAINING),
     }
 
     def __init__(self) -> None:
@@ -327,6 +378,10 @@ class H2Connection:
         self.streams: dict[int, H2Stream] = {}
         self.highest_inbound_stream_id = 0
         self.highest_outbound_stream_id = 0
+        # The last stream ID sent in an outbound GOAWAY frame, if any. While
+        # the connection is draining, streams with IDs above this bound are
+        # rejected. Repeated GOAWAY frames may only narrow this bound.
+        self._last_stream_id_sent_in_goaway: int | None = None
         self.encoder = Encoder()
         self.decoder = Decoder()
 
@@ -491,6 +546,16 @@ class H2Connection:
 
         if stream_id <= highest_stream_id:
             raise StreamIDTooLowError(stream_id, highest_stream_id)
+
+        if (self.state_machine.state is ConnectionState.DRAINING and
+                self._last_stream_id_sent_in_goaway is not None and
+                stream_id > self._last_stream_id_sent_in_goaway):
+            msg = (
+                f"Stream ID {stream_id} exceeds the last stream ID "
+                f"{self._last_stream_id_sent_in_goaway} sent in a GOAWAY "
+                f"frame."
+            )
+            raise ProtocolError(msg)
 
         if (stream_id % 2) != int(allowed_ids):
             msg = "Invalid stream ID for peer."
@@ -1103,6 +1168,10 @@ class H2Connection:
         if last_stream_id is None:
             last_stream_id = self.highest_inbound_stream_id
 
+        if (self._last_stream_id_sent_in_goaway is None or
+                last_stream_id < self._last_stream_id_sent_in_goaway):
+            self._last_stream_id_sent_in_goaway = last_stream_id
+
         f = GoAwayFrame(
             stream_id=0,
             last_stream_id=last_stream_id,
@@ -1589,6 +1658,9 @@ class H2Connection:
         f = GoAwayFrame(0)
         f.last_stream_id = self.highest_inbound_stream_id
         f.error_code = error_code
+        if (self._last_stream_id_sent_in_goaway is None or
+                f.last_stream_id < self._last_stream_id_sent_in_goaway):
+            self._last_stream_id_sent_in_goaway = f.last_stream_id
         self.state_machine.process_input(ConnectionInputs.SEND_GOAWAY)
         self._prepare_for_sending([f])
 
