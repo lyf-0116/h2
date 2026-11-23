@@ -14,7 +14,13 @@ dev
 
 **Bugfixes**
 
--
+- A DATA frame received on a stream that was never established and has a
+  stream ID lower than the highest inbound stream ID (an implicitly closed
+  stream), or whose closed-stream record has been evicted, is now treated as
+  a connection error of type PROTOCOL_ERROR, matching the behaviour for a
+  HEADERS frame on the same stream. Previously only a stream-level
+  RST_STREAM was emitted and the connection remained open, contrary to
+  RFC 9113 section 6.1.
 
 4.4.1 (2026-08-03)
 ------------------

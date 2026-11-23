@@ -81,6 +81,40 @@ class TestClosedStreams:
         )
         assert c.data_to_send() == f.serialize()
 
+    def test_receiving_data_on_implicitly_closed_stream_causes_goaway(
+        self, frame_factory,
+    ) -> None:
+        """
+        A DATA frame received on a stream that was never established but has
+        an ID lower than the highest inbound stream ID (an implicitly closed
+        stream) is a connection error, just like a HEADERS frame on the same
+        stream. See RFC 9113 section 6.1.
+        """
+        c = h2.connection.H2Connection(config=self.server_config)
+        c.receive_data(frame_factory.preamble())
+        c.initiate_connection()
+
+        f = frame_factory.build_headers_frame(
+            self.example_request_headers,
+            stream_id=3,
+        )
+        c.receive_data(f.serialize())
+        c.clear_outbound_data_buffer()
+
+        f = frame_factory.build_data_frame(
+            data=b"some data",
+            stream_id=1,
+        )
+
+        with pytest.raises(h2.exceptions.ProtocolError):
+            c.receive_data(f.serialize())
+
+        f = frame_factory.build_goaway_frame(
+            last_stream_id=3,
+            error_code=h2.errors.ErrorCodes.PROTOCOL_ERROR,
+        )
+        assert c.data_to_send() == f.serialize()
+
     def test_closed_stream_not_present_in_streams_dict(self, frame_factory) -> None:
         """
         When streams have been closed, they get removed from the streams

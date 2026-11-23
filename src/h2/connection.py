@@ -1703,6 +1703,20 @@ class H2Connection:
                                       events: list[Event],
                                       exc: StreamClosedError,
                                       frame: DataFrame) -> tuple[list[Frame], list[Event]]:
+        # If we have no record of how this stream was closed, it was never
+        # established: it is either an idle stream whose ID is lower than the
+        # highest stream ID we have seen (an implicitly closed stream) or a
+        # closed stream whose record has been evicted. RFC 9113 §6.1 requires
+        # a DATA frame received on an idle stream to be treated as a
+        # connection error of type PROTOCOL_ERROR, mirroring how a HEADERS
+        # frame on the same stream is handled above.
+        if self._stream_closed_by(exc.stream_id) is None:
+            msg = (
+                f"Received DATA frame on stream {exc.stream_id}, which is "
+                "not open"
+            )
+            raise ProtocolError(msg) from exc
+
         # This stream is already closed - and yet we received a DATA frame.
         # The received DATA frame counts towards the connection flow window.
         # We need to manually to acknowledge the DATA frame to update the flow
